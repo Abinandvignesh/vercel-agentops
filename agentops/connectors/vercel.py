@@ -46,4 +46,40 @@ class VercelConnector:
         data = self._get(f'/v3/deployments/{deployment_id}/events', limit=min(limit, 200), direction='backward', follow=0)
         if not isinstance(data, list):
             return []
-        return [{'type': e.get('type'), 'created': e.get('created'), 'text': str((e.get('payload') or {}).get('text') or '')[:1000], 'statusCode': (e.get('payload') or {}).get('statusCode')} for e in data]
+        
+        def _extract_text(e):
+            if not isinstance(e, dict):
+                return str(e)[:1000]
+            # Top-level direct keys
+            for k in ('text', 'message', 'data', 'info'):
+                v = e.get(k)
+                if v and isinstance(v, str) and v.strip():
+                    return v[:1000]
+            # Nested in payload
+            p = e.get('payload')
+            if isinstance(p, str) and p.strip():
+                return p[:1000]
+            if isinstance(p, dict):
+                for k in ('text', 'message', 'info', 'data', 'error', 'name'):
+                    v = p.get(k)
+                    if v and isinstance(v, str) and v.strip():
+                        return v[:1000]
+            return ''
+
+        def _extract_status(e):
+            if not isinstance(e, dict):
+                return None
+            p = e.get('payload')
+            if isinstance(p, dict) and p.get('statusCode') is not None:
+                return p.get('statusCode')
+            return e.get('statusCode')
+
+        return [
+            {
+                'type': e.get('type') if isinstance(e, dict) else 'event',
+                'created': e.get('created') if isinstance(e, dict) else None,
+                'text': _extract_text(e),
+                'statusCode': _extract_status(e),
+            }
+            for e in data
+        ]

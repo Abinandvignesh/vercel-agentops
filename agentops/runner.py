@@ -28,13 +28,14 @@ def investigate(run_id, connector, project_id, deployment_id, provider):
 
         events = connector.deployment_events(deployment_id, limit=200)
         drain  = store.drain_summary(deployment_id)
+        drain_entries = store.drain_logs(deployment_id, limit=300)
         store.log(run_id, 'INFO',
-                  f'Fetched {len(events)} events; drain_total={drain["total"] or 0}')
+                  f'Fetched {len(events)} events; drain_total={drain.get("total") or 0} (analyzing {len(drain_entries)} logs)')
 
         # ── 2. Deterministic analysis ─────────────────────────────────────────
         # Drain is now folded into the metrics dict so the LLM sees it
         summary    = metrics([selected], events, drain)
-        evidence   = event_evidence(events, limit=15)   # 15 not 30 → fewer tokens
+        evidence   = event_evidence(events, drain_entries=drain_entries, limit=15)
         categories = fp_module.categorize(evidence, events)
         fingerprint = fp_module.compute(evidence, summary)
 

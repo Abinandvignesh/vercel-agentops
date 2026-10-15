@@ -38,42 +38,77 @@ def metrics(deployments, events, drain=None):
     return m
 
 
-def event_evidence(events, limit=15):
+def event_evidence(events, drain_entries=None, limit=15):
     """
-    Redacted, bounded excerpts for error-like events only.
-    Limit reduced from 30 → 15 and excerpt from 500 → 300 chars for token efficiency.
+    Extract bounded, redacted excerpts from both:
+    1. Runtime Log Drain errors (500s, exceptions, stderr from production traffic)
+    2. Build/Deployment events (compile errors, OOM, timeouts)
     """
-    candidates = [
-        e for e in events
-        if e.get('type') in ('stderr', 'fatal') or
-        (isinstance(e.get('statusCode'), int) and e['statusCode'] >= 400)
-    ]
-    return [
-        {
-            'created':    e.get('created'),
-            'type':       e.get('type'),
-            'statusCode': e.get('statusCode'),
-            'excerpt':    redact(str(e.get('text') or ''))[:300],
-        }
-        for e in candidates[:limit]
-    ]
+    evidence_list = []
+
+    # 1. Runtime Drain errors (highest diagnostic value for running apps)
+    for r in (drain_entries or []):
+        lvl = (r.get('level') or '').lower()
+        code = r.get('status_code')
+        msg = (r.get('message') or '').strip()
+        path = r.get('path') or ''
+
+        is_error = (
+            lvl in ('error', 'fatal') or
+            (isinstance(code, int) and code >= 400) or
+            any(w in msg.lower() for w in ('error', 'fatal', 'exception', 'failed', 'traceback', 'prisma', 'econn', 'timeout', 'unhandled'))
+        )
+        if is_error and (msg or code):
+            excerpt_text = f"[{path}] {msg}" if path else msg
+            evidence_list.append({
+                'source': 'runtime_drain',
+                'created': r.get('ts') or r.get('received'),
+                'type': r.get('level') or (f"http_{code}" if code else 'error'),
+                'statusCode': code,
+                'path': path or None,
+                'excerpt': redact(excerpt_text)[:300].strip(),
+            })
+
+    # 2. Deployment/Build events
+    for e in events:
+        t = e.get('type')
+        code = e.get('statusCode')
+        text = str(e.get('text') or '').strip()
+        is_err = t in ('stderr', 'fatal') or (isinstance(code, int) and code >= 400)
+        if is_err:
+            evidence_list.append({
+                'source': 'build_event',
+                'created': e.get('created'),
+                'type': t,
+                'statusCode': code,
+                'path': None,
+                'excerpt': redact(text)[:300].strip(),
+            })
+
+    # Prioritise non-empty excerpts over blank ones
+    non_empty = [e for e in evidence_list if e['excerpt']]
+    empty = [e for e in evidence_list if not e['excerpt']]
+    combined = non_empty + empty
+
+    return combined[:limit]
 
 
 # ── Structured LLM prompt ─────────────────────────────────────────────────────
 # Compact one-shot prompt that forces JSON output and keeps token count low.
 _PROMPT_HEADER = (
-    'You are a deployment operations analyst. '
+    'You are an expert Vercel cloud deployment and runtime operations analyst.\n'
+    'Analyze the provided deployment metrics and error evidence (including runtime log drain errors and endpoints).\n'
     'Respond ONLY with a single valid JSON object. No markdown fences, no text outside JSON.\n\n'
     'Required schema:\n'
     '{"severity":"low|medium|high|critical",'
     '"error_category":"string",'
-    '"root_cause_hypothesis":"one sentence, or Insufficient evidence",'
+    '"root_cause_hypothesis":"Concise, specific sentence identifying the exact error, failing path, or cause",'
     '"confidence":0.0,'
-    '"key_evidence":["quoted excerpt or timestamp"],'
-    '"recommended_steps":["step 1","step 2"],'
+    '"key_evidence":["quoted excerpt, status code, or endpoint"],'
+    '"recommended_steps":["actionable step 1","actionable step 2"],'
     '"needs_human_escalation":false,'
     '"analysis_notes":"string"}\n\n'
-    'Rules: never invent root causes; quote timestamps; distinguish warnings from confirmed errors.\n\n'
+    'Rules: Identify failing API routes or components if present; distinguish runtime drain errors from build warnings; provide concrete fix steps.\n\n'
     'DATA:\n'
 )
 
